@@ -23,6 +23,7 @@ def download_dataset()->None:
         print(f"Downloading dataset from {dataset_url} to {DTST_PATH}")
         df = pd.read_parquet(dataset_url)
         df.to_parquet(DTST_PATH, compression='snappy', index=False)
+    print("Dataset Dowloaded")
 
 def read_dataset()->Union[pd.DataFrame, None]:
     """
