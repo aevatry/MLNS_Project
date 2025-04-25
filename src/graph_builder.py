@@ -17,13 +17,14 @@ class Paths(Enum):
         os.makedirs(DATA_DIR)
     GRAPH_PATH = os.path.join(DATA_DIR, "lastfm_graph.graphml")
 
-def build_graph_from_dataframe(df:pd.DataFrame)->nx.Graph:
+def build_graph_from_dataframe(df:pd.DataFrame, save:bool=True)->nx.Graph:
     """
     Build a graph from the pandas DataFrame representation of the LastFM dataset and saves it to the local data folder.
     Only 3 columns are expected and used: 'user_id', 'artist_id', and 'track_id'.
 
     Args:
         df (pd.DataFrame): DataFrame to construct the graph from. It is expected that the rows have been cleared of NaN values.
+        save (bool, optional): Whether to save the graph to a file. Defaults to True.
 
     Returns:
         nx.Graph: Graph representation of the LastFM dataset.
@@ -74,9 +75,10 @@ def build_graph_from_dataframe(df:pd.DataFrame)->nx.Graph:
                 G.add_edge(artist_id, track_id)
         
 
-    # Save the graph to a GraphML file
-    nx.write_graphml(G, Paths.GRAPH_PATH.value)
-    print(f"Graph saved to {Paths.GRAPH_PATH.value}")
+    # Save the graph to a GraphML file if wanted
+    if save:
+        nx.write_graphml(G, Paths.GRAPH_PATH.value)
+        print(f"Graph saved to {Paths.GRAPH_PATH.value}")
 
     return G
 

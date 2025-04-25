@@ -1,50 +1,98 @@
+
 import torch
-import pandas as pd
-from tqdm import tqdm
-import math
+import torch_geometric
+from torch_geometric.nn import LGConv
 import numpy as np
 import pandas as pd
+from torch_sparse import SparseTensor
+import math
+from tqdm import tqdm
 
 from .helper import set_all_seeds, evaluate, DF_KEYS
 from .pws_sampler import PairWiseSampler
 
 
-class MatrixFactorizationModel(torch.nn.Module):
-    def __init__(self, num_users, num_items, embedding_size, seed=42, **kwargs):
+class LightGCNModel(torch.nn.Module):
+    def __init__(self, num_users, num_items, embedding_size, num_layers, adj, normalize, seed=42, **kwargs):
         super().__init__()
 
         # Set all seeds
         set_all_seeds(seed)
 
+        self.num_users = num_users
+        self.num_items = num_items
+
         # Initialize the user and item embeddings
-        self.Gu = torch.nn.Embedding(num_embeddings=num_users, embedding_dim=embedding_size)
-        torch.nn.init.xavier_uniform_(self.Gu.weight)
-        self.Gi = torch.nn.Embedding(num_embeddings=num_items, embedding_dim=embedding_size)
-        torch.nn.init.xavier_uniform_(self.Gi.weight)
+        self.Gu = torch.nn.Embedding(
+            num_embeddings=num_users, embedding_dim=embedding_size)
+        self.Gi = torch.nn.Embedding(
+            num_embeddings=num_items, embedding_dim=embedding_size)
+        torch.nn.init.normal_(self.Gu.weight, std=0.1)
+        torch.nn.init.normal_(self.Gi.weight, std=0.1)
+
+        # LightGCN layers
+        self.n_layers = num_layers
+        self.adj = adj
+        propagation_network_list = []
+        for _ in range(self.n_layers):
+            propagation_network_list.append((LGConv(normalize=normalize), 'x, edge_index -> x'))
+        self.propagation_network = torch_geometric.nn.Sequential('x, edge_index', propagation_network_list)
+
+    # Message-passing function
+    def propagate_embeddings(self, evaluate=False):
+        ego_embeddings = torch.cat((self.Gu.weight, self.Gi.weight), 0)
+        all_embeddings = [ego_embeddings]
+
+        for layer in range(self.n_layers):
+            if evaluate:
+                self.propagation_network.eval()
+                with torch.no_grad():
+                    all_embeddings += [list(
+                        self.propagation_network.children()
+                    )[layer](all_embeddings[layer], self.adj)]
+            else:
+                all_embeddings += [list(
+                    self.propagation_network.children()
+                )[layer](all_embeddings[layer], self.adj)]
+
+        if evaluate:
+            self.propagation_network.train()
+
+        all_embeddings = torch.mean(torch.stack(all_embeddings, 0), dim=0)
+        gu, gi = torch.split(all_embeddings, [self.num_users, self.num_items], 0)
+        return gu, gi
 
     # Forward function
-    def forward(self, inputs):
-        user_idx, item_idx = inputs
-        gu = self.Gu(user_idx)
-        gi = self.Gi(item_idx)
+    @staticmethod
+    def forward(inputs):
+        gu, gi = inputs
         xui = torch.sum(gu * gi, 1)
         return xui
 
     # Train step for each batch
     def train_step(self, batch):
+        gu, gi = self.propagate_embeddings()
         user, pos, neg = batch
-        xu_pos = self.forward(inputs=(torch.tensor(user), torch.tensor(pos)))
-        xu_neg = self.forward(inputs=(torch.tensor(user), torch.tensor(neg)))
+        xu_pos = self.forward(inputs=(gu[torch.tensor(user)], gi[torch.tensor(pos)]))
+        xu_neg = self.forward(inputs=(gu[torch.tensor(user)], gi[torch.tensor(neg)]))
         return xu_pos, xu_neg
 
     # Predict function for the evaluation
-    def predict(self, user_idx, **kwargs):
-        gu = self.Gu(user_idx)
-        return torch.matmul(gu, torch.transpose(self.Gi.weight, 0, 1))
-    
+    def predict(self, gu, gi, **kwargs):
+        return torch.sigmoid(torch.matmul(gu, torch.transpose(gi, 0, 1)))
 
-class MatrixFactorization:
-    def __init__(self, df:pd.DataFrame, batch_size:int, embedding_size:int, learning_rate:float, regularization:float, top_k:int=20, seed:int=42):
+
+class LightGCN:
+    def __init__(self,
+                 df:pd.DataFrame,
+                 batch_size:int,
+                 embedding_size:int,
+                 num_layers:int,
+                 normalize:bool,
+                 learning_rate:float,
+                 regularization:float,
+                 top_k:int=20,
+                 seed:int=42):
         # Initialize the sampler
         self.pws = PairWiseSampler(df, batch_size=batch_size, seed=seed)
 
@@ -58,11 +106,24 @@ class MatrixFactorization:
         pos_items = self.pws.train[I_KEY].tolist()
         self.train_mask[pos_users, pos_items] = True
 
+        # Create the adjacency matrix for the bipartite and undirected user-item graph
+        rows = pos_users
+        cols = [it + self.pws.data_stats['num_users'] for it in pos_items]
+        edge_index = np.array([rows, cols])
+        edge_index = torch.tensor(edge_index, dtype=torch.int64)
+        self.adj = SparseTensor(row=torch.cat([edge_index[0], edge_index[1]], dim=0),
+                                col=torch.cat([edge_index[1], edge_index[0]], dim=0),
+                                sparse_sizes=(self.pws.data_stats['num_users'] + self.pws.data_stats['num_items'],
+                                              self.pws.data_stats['num_users'] + self.pws.data_stats['num_items']))
+
         # Initialize the model
-        self.model = MatrixFactorizationModel(embedding_size=embedding_size,
-                                              num_users=self.pws.data_stats['num_users'],
-                                              num_items=self.pws.data_stats['num_items'],
-                                              seed=seed)
+        self.model = LightGCNModel(embedding_size=embedding_size,
+                                   num_users=self.pws.data_stats['num_users'],
+                                   num_items=self.pws.data_stats['num_items'],
+                                   num_layers=num_layers,
+                                   normalize=normalize,
+                                   adj=self.adj,
+                                   seed=seed)
 
         # Instantiate the optimizer (e.g., Adam)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
@@ -89,7 +150,7 @@ class MatrixFactorization:
             print('**************************************************************')
             print(f'Epoch {epoch + 1}/{epochs}')
 
-            transactions = len(self.pws.train)
+            transactions = self.pws.data_stats['num_interactions']
             batch_size = self.pws.batch_size
             n_batch = int(transactions / batch_size) if transactions % batch_size == 0 else int(transactions / batch_size) + 1
 
@@ -99,7 +160,7 @@ class MatrixFactorization:
 
                     xui, xuj = self.model.train_step(batch)
                     user, pos, neg = batch
-                    loss = -torch.mean(torch.nn.functional.logsigmoid(xui - xuj))
+                    loss = torch.mean(torch.nn.functional.softplus(xuj - xui))
                     reg_loss = self.reg * (1 / 2) * (self.model.Gu.weight[torch.tensor(user)].norm(2).pow(2) +
                                                      self.model.Gi.weight[torch.tensor(pos)].norm(2).pow(2) +
                                                      self.model.Gi.weight[torch.tensor(neg)].norm(2).pow(2)) / len(user)
@@ -117,9 +178,10 @@ class MatrixFactorization:
 
             if epoch % val_epoch == 0:
                 preds = torch.empty(self.pws.data_stats['num_users'], self.top_k, dtype=torch.long)
+                gu, gi = self.model.propagate_embeddings(evaluate=True)
                 for index, offset in enumerate(range(0, self.pws.data_stats['num_users'], self.pws.batch_size)):
                     offset_stop = min(offset + self.pws.batch_size, self.pws.data_stats['num_users'])
-                    predictions = self.model.predict(torch.arange(offset, offset_stop))
+                    predictions = self.model.predict(gu[offset: offset_stop], gi)
                     predictions[self.train_mask[offset:offset_stop]] = -float("inf")
                     _, sorted_pred = torch.topk(predictions, self.top_k)
                     preds[offset:offset_stop] = sorted_pred

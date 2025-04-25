@@ -19,7 +19,8 @@ class PairWiseSampler:
 
         # split the dataset into train, val and test sets
         train_df, val_df, test_df = split_dtst(last_fm_df, train_ratio=0.8)
-        # Read the dataset with pandas
+        
+ 
         self.train = train_df
 
         # set variables for the string key in the dataframe for users and items
