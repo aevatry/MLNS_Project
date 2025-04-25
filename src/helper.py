@@ -6,7 +6,7 @@ from enum import Enum
 
 class DF_KEYS(Enum):
     USERS = "user_id"
-    ITEMS = "artist_id"
+    ITEMS = "item_id"
 
 def set_all_seeds(random_seed):
     # Set seed
